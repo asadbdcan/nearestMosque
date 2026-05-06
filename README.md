@@ -94,9 +94,11 @@ A few honest caveats for the web build:
 
 - **Geolocation** uses the browser's `navigator.geolocation` API. It works on `localhost` and HTTPS but not on insecure remote hosts. Accuracy is lower than phone GPS — typically Wi-Fi-based.
 - **Mosque list** works perfectly: the OpenStreetMap Overpass API and Google Places both send permissive CORS headers, so the browser can call them directly.
-- **Scraping individual mosque websites from the browser is constrained by CORS.** Most mosque sites don't send `Access-Control-Allow-Origin`, so a direct `fetch()` is blocked. To make the web preview useful, the scraper automatically routes through a public CORS proxy (`https://corsproxy.io/?...`) when `Platform.OS === 'web'`.
-  - This proxy is **for previewing only** — don't ship it to production. For a real web deploy, run your own tiny proxy and set `EXPO_PUBLIC_CORS_PROXY=https://your-proxy.example/?url=` before `expo start --web`.
-  - On native iOS / Android there is **no CORS** and the scraper fetches each mosque site directly — no proxy involved.
+- **Scraping individual mosque websites from the browser is constrained by CORS.** Most mosque sites don't send `Access-Control-Allow-Origin`, so a direct `fetch()` is blocked. The scraper handles this with a layered strategy on web:
+  1. **Same-origin serverless function** at `/api/fetch-html?url=…` (`api/fetch-html.js`). When deployed to Vercel this is the primary path — fetches happen server-side, no CORS, no third-party dependency, free on the hobby tier.
+  2. **Your own proxy** if you set `EXPO_PUBLIC_CORS_PROXY=https://your-proxy.example/?url=`.
+  3. **Public proxies** (AllOrigins → corsproxy.io → thingproxy) as last-resort fallbacks for local dev.
+  - On native iOS / Android there is **no CORS** and the scraper fetches each mosque site directly — none of this proxy machinery runs.
 - **Haptics** are no-ops on web (the calls are wrapped in `.catch(() => {})`).
 
 ### 5. Deploy the web build to Vercel

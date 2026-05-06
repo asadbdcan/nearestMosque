@@ -24,14 +24,47 @@ import { Platform } from 'react-native';
  * public CORS proxy. On native (iOS/Android) the fetch goes direct.
  */
 
-// Public CORS relay used only when running in a browser (Expo web).
-// Override at build time with EXPO_PUBLIC_CORS_PROXY=https://your-proxy.example/?url=
-const WEB_CORS_PROXY =
-  process.env.EXPO_PUBLIC_CORS_PROXY || 'https://corsproxy.io/?';
-
-function proxiedUrl(url) {
-  if (Platform.OS !== 'web') return url;
-  return `${WEB_CORS_PROXY}${encodeURIComponent(url)}`;
+/**
+ * Build the ordered list of fetchers to try when running on web.
+ *
+ *   1. Same-origin Vercel function (/api/fetch-html?url=…) — works on
+ *      the deployed site, no CORS, no third-party dependency.
+ *   2. EXPO_PUBLIC_CORS_PROXY — lets you point at your own proxy.
+ *   3. Public proxies as last-resort fallbacks.
+ *
+ * Each fetcher is { label, build(url) -> requestUrl }. On native we just
+ * fetch directly — no CORS exists.
+ */
+function webFetchStrategies() {
+  const strategies = [
+    {
+      label: 'serverless',
+      build: (u) => `/api/fetch-html?url=${encodeURIComponent(u)}`,
+    },
+  ];
+  const userProxy = process.env.EXPO_PUBLIC_CORS_PROXY;
+  if (userProxy) {
+    strategies.push({
+      label: 'user-proxy',
+      build: (u) => `${userProxy}${encodeURIComponent(u)}`,
+    });
+  }
+  // Public fallbacks — last resort. Each handles `?url=` differently.
+  strategies.push(
+    {
+      label: 'allorigins',
+      build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    },
+    {
+      label: 'corsproxy.io',
+      build: (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    },
+    {
+      label: 'thingproxy',
+      build: (u) => `https://thingproxy.freeboard.io/fetch/${u}`,
+    }
+  );
+  return strategies;
 }
 
 const PRAYER_KEYS = [
@@ -144,31 +177,60 @@ export function parseSalahTimes(html) {
 export async function fetchSalahTimes(url) {
   if (!url) throw new Error('This mosque has no website on file, so we cannot fetch its prayer times.');
 
-  let res;
-  try {
-    res = await fetch(proxiedUrl(url), {
-      headers: {
-        // User-Agent is ignored on web (browsers forbid setting it),
-        // honoured on native.
-        'User-Agent': 'NearestMosqueApp/1.0 (+https://example.com)',
-        Accept: 'text/html,*/*',
-      },
-    });
-  } catch (e) {
-    const tip =
-      Platform.OS === 'web'
-        ? ' If this happens repeatedly on web, set EXPO_PUBLIC_CORS_PROXY to your own proxy.'
-        : '';
-    throw new Error(`Could not reach the mosque website (${e.message}).${tip}`);
-  }
-
-  if (!res.ok) {
-    throw new Error(`Mosque website returned ${res.status}.`);
-  }
-
-  const html = await res.text();
+  const html = await fetchHtml(url);
   const parsed = parseSalahTimes(html);
   return { ...parsed, source: url };
+}
+
+/**
+ * Fetch HTML for `url`. On native goes direct; on web walks the
+ * proxy strategy list and returns the first response that yields a
+ * non-empty 2xx HTML body.
+ */
+async function fetchHtml(url) {
+  if (Platform.OS !== 'web') {
+    let res;
+    try {
+      res = await fetch(url, {
+        headers: {
+          'User-Agent': 'NearestMosqueApp/1.0 (+https://example.com)',
+          Accept: 'text/html,*/*',
+        },
+      });
+    } catch (e) {
+      throw new Error(`Could not reach the mosque website (${e.message}).`);
+    }
+    if (!res.ok) throw new Error(`Mosque website returned ${res.status}.`);
+    return res.text();
+  }
+
+  const failures = [];
+  for (const strat of webFetchStrategies()) {
+    try {
+      const res = await fetch(strat.build(url), {
+        headers: { Accept: 'text/html,*/*' },
+      });
+      if (!res.ok) {
+        failures.push(`${strat.label}: HTTP ${res.status}`);
+        continue;
+      }
+      const text = await res.text();
+      if (!text || text.length < 30) {
+        failures.push(`${strat.label}: empty response`);
+        continue;
+      }
+      return text;
+    } catch (e) {
+      failures.push(`${strat.label}: ${e.message || e}`);
+      continue;
+    }
+  }
+
+  throw new Error(
+    `The mosque website could not be loaded from the browser. ` +
+      `All proxy attempts failed (${failures.join('; ')}). ` +
+      `Tap "Website" to open it directly, or deploy this app with the included /api/fetch-html function.`
+  );
 }
 
 // Exported for testing in isolation.
