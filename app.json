@@ -1,0 +1,53 @@
+{
+  "expo": {
+    "name": "Nearest Mosque",
+    "slug": "nearest-mosque-salah",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "automatic",
+    "splash": {
+      "image": "./assets/splash.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0B3D2E"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.ashraf.nearestmosque",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "We use your location to find the nearest mosque and show its prayer times."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B3D2E"
+      },
+      "package": "com.ashraf.nearestmosque",
+      "permissions": [
+        "ACCESS_FINE_LOCATION",
+        "ACCESS_COARSE_LOCATION"
+      ],
+      "config": {
+        "googleMaps": {
+          "apiKey": "REPLACE_WITH_GOOGLE_MAPS_KEY"
+        }
+      }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "extra": {
+      "googlePlacesApiKey": "REPLACE_WITH_GOOGLE_PLACES_KEY"
+    },
+    "plugins": [
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Allow Nearest Mosque to use your location to find nearby mosques."
+        }
+      ]
+    ]
+  }
+}
