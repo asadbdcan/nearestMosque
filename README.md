@@ -99,7 +99,26 @@ A few honest caveats for the web build:
   - On native iOS / Android there is **no CORS** and the scraper fetches each mosque site directly — no proxy involved.
 - **Haptics** are no-ops on web (the calls are wrapped in `.catch(() => {})`).
 
-### 5. Build a standalone app
+### 5. Deploy the web build to Vercel
+
+A `vercel.json` is included. To deploy:
+
+1. Push the project to GitHub (or any git host Vercel can read).
+2. In Vercel, click **Add New → Project**, import the repo.
+3. Leave the framework preset on **Other** — `vercel.json` already overrides it. The settings will resolve to:
+   - **Build Command:** `npx expo export --platform web`
+   - **Output Directory:** `dist`
+   - **Install Command:** `npm install`
+4. (Optional) Under **Environment Variables**, add:
+   - `EXPO_PUBLIC_GOOGLE_PLACES_KEY` — if you want Google Places instead of OpenStreetMap on the deployed site.
+   - `EXPO_PUBLIC_CORS_PROXY` — your own CORS relay URL (e.g. `https://your-proxy.example/?url=`). Without one, the deployed site falls back to the public `corsproxy.io` for scraping mosque websites.
+5. Deploy. The first build takes ~1–2 min; subsequent ones are faster thanks to Vercel's cache.
+
+The included `vercel.json` also adds SPA rewrites (so React Navigation routes don't 404 on refresh) and a `Permissions-Policy: geolocation=(self)` header so the browser will prompt for location.
+
+> **If you already deployed and got a 404:** Vercel deployed your raw source without building. Push the new `vercel.json`, then in the Vercel dashboard either trigger a redeploy, or change the project's *Build & Output Settings* to match the values above and redeploy.
+
+### 6. Build a standalone mobile app
 
 ```bash
 npx eas build -p android   # APK / AAB via EAS Build
