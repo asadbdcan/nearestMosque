@@ -1,17 +1,27 @@
 import Constants from 'expo-constants';
+import { Platform } from 'react-native';
 import { distanceMeters } from './location';
 import { findNearbyMosquesOSM, getMosqueDetailsOSM } from './osm';
 
 /**
  * Mosque provider router.
  *
- * If a Google Places API key is configured (app.json → expo.extra.googlePlacesApiKey,
- * or EXPO_PUBLIC_GOOGLE_PLACES_KEY), use Google for richer data (ratings,
- * Open-now status, formatted addresses, photos). Otherwise fall back to
- * OpenStreetMap / Overpass — completely free, no API key required.
+ * Provider selection:
+ *   - Google Places (preferred) — when an API key is configured, OR when
+ *     running in the browser on a Vercel deploy that has a server-side
+ *     GOOGLE_PLACES_KEY (the React app calls /api/places-* and never sees
+ *     the key). On native (iOS/Android) we still need EXPO_PUBLIC_… so
+ *     the key is in the bundle.
+ *   - OpenStreetMap / Overpass — free fallback, no key required.
  *
- * Both providers return objects with the same shape, so screens are
- * provider-agnostic.
+ * Transport on web:
+ *   The Google Places Web Service does not reliably support CORS, so the
+ *   browser cannot call it directly. On `Platform.OS === 'web'` we route
+ *   every Google call through the same-origin /api/places-nearby and
+ *   /api/place-details Vercel functions defined in /api. This also keeps
+ *   the API key fully server-side on the deployed web build.
+ *
+ * Both providers return identical mosque shapes.
  */
 
 export function getApiKey() {
@@ -24,21 +34,50 @@ export function getApiKey() {
   return key;
 }
 
+/**
+ * Whether to assume Google Places is available without checking for a
+ * client-side key. On the web we ALWAYS try the same-origin /api proxy
+ * first; if it returns 404 or 5xx we fall back to OSM. The proxy uses
+ * the server-side GOOGLE_PLACES_KEY env var, which is invisible to the
+ * browser bundle.
+ */
+function preferGoogleOnWeb() {
+  return Platform.OS === 'web';
+}
+
 export function getActiveProvider() {
-  return getApiKey() ? 'google' : 'osm';
+  if (getApiKey()) return 'google';
+  if (preferGoogleOnWeb()) return 'google'; // optimistic — proxy will tell us
+  return 'osm';
 }
 
 // ---------------------------------------------------------------------------
-// Google Places implementation
+// Google Places — transport helpers (web vs native)
 // ---------------------------------------------------------------------------
 
-// How many of the nearest results to enrich with Place Details on a single
-// search. Place Details is a separately-billed Google SKU, so we don't run
-// it for every result — just the ones the user is most likely to look at.
 const ENRICH_TOP_N = 12;
 
-async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = ENRICH_TOP_N }) {
+async function callPlacesNearby({ coords, radius }) {
+  if (Platform.OS === 'web') {
+    const url =
+      `/api/places-nearby?lat=${coords.latitude}&lng=${coords.longitude}&radius=${radius}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const j = await res.json();
+        detail = j.error || j.detail || '';
+      } catch {}
+      throw new Error(
+        `Server proxy returned ${res.status}.${detail ? ' ' + detail : ''}`
+      );
+    }
+    return res.json();
+  }
+
+  // Native: call Google directly (no CORS in native fetch).
   const key = getApiKey();
+  if (!key) throw new Error('Google Places API key is not configured.');
   const url =
     'https://maps.googleapis.com/maps/api/place/nearbysearch/json' +
     `?location=${coords.latitude},${coords.longitude}` +
@@ -46,19 +85,70 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
     '&type=mosque' +
     '&keyword=mosque%20masjid%20islamic%20center' +
     `&key=${key}`;
-
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Places request failed (${res.status}).`);
-  const data = await res.json();
+  return res.json();
+}
+
+async function callPlaceDetails(placeId) {
+  if (Platform.OS === 'web') {
+    const url = `/api/place-details?placeId=${encodeURIComponent(placeId)}`;
+    const res = await fetch(url);
+    if (!res.ok) {
+      let detail = '';
+      try {
+        const j = await res.json();
+        detail = j.error || j.detail || '';
+      } catch {}
+      throw new Error(
+        `Place Details proxy returned ${res.status}.${detail ? ' ' + detail : ''}`
+      );
+    }
+    return res.json();
+  }
+
+  const key = getApiKey();
+  if (!key) throw new Error('Google Places API key is not configured.');
+  const fields = [
+    'name',
+    'formatted_address',
+    'formatted_phone_number',
+    'international_phone_number',
+    'website',
+    'url',
+    'opening_hours',
+    'geometry',
+    'rating',
+    'user_ratings_total',
+  ].join(',');
+  const url =
+    'https://maps.googleapis.com/maps/api/place/details/json' +
+    `?place_id=${encodeURIComponent(placeId)}` +
+    `&fields=${fields}` +
+    `&key=${key}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`Place details failed (${res.status}).`);
+  return res.json();
+}
+
+// ---------------------------------------------------------------------------
+// Google Places — high-level
+// ---------------------------------------------------------------------------
+
+async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = ENRICH_TOP_N }) {
+  const data = await callPlacesNearby({ coords, radius });
 
   if (data.status === 'REQUEST_DENIED') {
-    throw new Error(data.error_message || 'Places API: request denied. Check your API key.');
+    throw new Error(
+      data.error_message ||
+        'Places API: request denied. Verify the API key, enabled APIs, and referrer/IP restrictions.'
+    );
   }
   if (data.status === 'OVER_QUERY_LIMIT') {
     throw new Error('Places API: over quota. Please try again later.');
   }
   if (data.status !== 'OK' && data.status !== 'ZERO_RESULTS') {
-    throw new Error(`Places API: ${data.status}`);
+    throw new Error(`Places API: ${data.status}${data.error_message ? ' — ' + data.error_message : ''}`);
   }
 
   const list = (data.results || []).map((p) => {
@@ -74,7 +164,7 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
       address: p.vicinity || p.formatted_address || '',
       location: loc,
       distance: loc.latitude ? distanceMeters(coords, loc) : Number.POSITIVE_INFINITY,
-      website: null,             // populated by enrich step below
+      website: null,
       phone: null,
       rating: p.rating ?? null,
       ratingsTotal: p.user_ratings_total ?? null,
@@ -86,8 +176,6 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
   });
   list.sort((a, b) => a.distance - b.distance);
 
-  // Enrich the top N nearest with Place Details (phone, website, full
-  // address) in parallel so the Home list can show contact info.
   if (enrichDetailsCount > 0) {
     const enrichTargets = list.slice(0, enrichDetailsCount);
     await Promise.allSettled(
@@ -103,8 +191,7 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
           if (d.ratingsTotal != null) m.ratingsTotal = d.ratingsTotal;
           m.detailsLoaded = true;
         } catch {
-          // Best-effort enrichment — leave detailsLoaded false and let
-          // the detail screen retry on demand.
+          // Leave detailsLoaded false; detail screen retries on demand.
         }
       })
     );
@@ -114,31 +201,9 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
 }
 
 async function getMosqueDetailsGoogle(mosque) {
-  const key = getApiKey();
   if (!mosque?.placeId) throw new Error('placeId is required for Google details.');
 
-  const fields = [
-    'name',
-    'formatted_address',
-    'formatted_phone_number',
-    'international_phone_number',
-    'website',
-    'url',
-    'opening_hours',
-    'geometry',
-    'rating',
-    'user_ratings_total',
-  ].join(',');
-
-  const url =
-    'https://maps.googleapis.com/maps/api/place/details/json' +
-    `?place_id=${encodeURIComponent(mosque.placeId)}` +
-    `&fields=${fields}` +
-    `&key=${key}`;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Place details failed (${res.status}).`);
-  const data = await res.json();
+  const data = await callPlaceDetails(mosque.placeId);
   if (data.status !== 'OK') {
     throw new Error(data.error_message || `Place details: ${data.status}`);
   }
@@ -163,28 +228,39 @@ async function getMosqueDetailsGoogle(mosque) {
 // ---------------------------------------------------------------------------
 
 /**
- * Find nearby mosques. Uses Google if a key is configured, otherwise OSM.
+ * Find nearby mosques.
  *
- *   coords                – { latitude, longitude }
- *   radius                – metres (default 5000)
- *   enrichDetailsCount    – Google only: how many top results to enrich
- *                           with Place Details (phone, website). Default 12.
- *                           Set to 0 to skip enrichment (cheaper, no contact
- *                           info on cards until you tap into a mosque).
+ * Routing rules:
+ *   - Native + key configured → Google direct.
+ *   - Web (any deploy) → /api/places-nearby (server proxy). If the proxy
+ *     responds with 500/404/etc. we fall through to OSM so the app keeps
+ *     working when the env var isn't set up.
+ *   - No key, native → OSM.
  */
 export async function findNearbyMosques(
   coords,
   { radius = 5000, enrichDetailsCount } = {}
 ) {
-  if (getApiKey()) {
-    return findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount });
+  const tryGoogle = getApiKey() || preferGoogleOnWeb();
+  if (tryGoogle) {
+    try {
+      return await findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount });
+    } catch (e) {
+      // On web, the proxy may be missing or misconfigured. Fall back to
+      // OSM rather than failing outright. We rethrow on native to make
+      // misconfiguration loud during development.
+      if (Platform.OS === 'web') {
+        console.warn('[mosques] Google proxy failed, falling back to OSM:', e.message);
+        return findNearbyMosquesOSM(coords, { radius });
+      }
+      throw e;
+    }
   }
   return findNearbyMosquesOSM(coords, { radius });
 }
 
 /**
- * Get extended details for a selected mosque. Accepts the mosque object
- * itself so the router can pick the right provider.
+ * Get extended details for a selected mosque.
  */
 export async function getMosqueDetails(mosque) {
   if (!mosque) throw new Error('mosque is required.');
