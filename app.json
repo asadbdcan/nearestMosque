@@ -39,7 +39,7 @@
       "bundler": "metro"
     },
     "extra": {
-      "googlePlacesApiKey": "REPLACE_WITH_GOOGLE_PLACES_KEY"
+      "googlePlacesApiKey": "AIzaSyDs4kUoOnxcIpG_UZLK_swEvYCScXP4n2U"
     },
     "plugins": [
       [
