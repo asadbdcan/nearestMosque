@@ -32,7 +32,12 @@ export function getActiveProvider() {
 // Google Places implementation
 // ---------------------------------------------------------------------------
 
-async function findNearbyMosquesGoogle(coords, { radius }) {
+// How many of the nearest results to enrich with Place Details on a single
+// search. Place Details is a separately-billed Google SKU, so we don't run
+// it for every result — just the ones the user is most likely to look at.
+const ENRICH_TOP_N = 12;
+
+async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = ENRICH_TOP_N }) {
   const key = getApiKey();
   const url =
     'https://maps.googleapis.com/maps/api/place/nearbysearch/json' +
@@ -69,16 +74,42 @@ async function findNearbyMosquesGoogle(coords, { radius }) {
       address: p.vicinity || p.formatted_address || '',
       location: loc,
       distance: loc.latitude ? distanceMeters(coords, loc) : Number.POSITIVE_INFINITY,
-      website: null,             // populated by getMosqueDetails
+      website: null,             // populated by enrich step below
       phone: null,
       rating: p.rating ?? null,
       ratingsTotal: p.user_ratings_total ?? null,
       openNow: p.opening_hours?.open_now,
       openingHours: null,
       googleMapsUrl: null,
+      detailsLoaded: false,
     };
   });
   list.sort((a, b) => a.distance - b.distance);
+
+  // Enrich the top N nearest with Place Details (phone, website, full
+  // address) in parallel so the Home list can show contact info.
+  if (enrichDetailsCount > 0) {
+    const enrichTargets = list.slice(0, enrichDetailsCount);
+    await Promise.allSettled(
+      enrichTargets.map(async (m) => {
+        try {
+          const d = await getMosqueDetailsGoogle(m);
+          m.address = d.address || m.address;
+          m.phone = d.phone || null;
+          m.website = d.website || null;
+          m.googleMapsUrl = d.googleMapsUrl || null;
+          m.openingHours = d.openingHours || null;
+          if (d.rating != null) m.rating = d.rating;
+          if (d.ratingsTotal != null) m.ratingsTotal = d.ratingsTotal;
+          m.detailsLoaded = true;
+        } catch {
+          // Best-effort enrichment — leave detailsLoaded false and let
+          // the detail screen retry on demand.
+        }
+      })
+    );
+  }
+
   return list;
 }
 
@@ -133,10 +164,20 @@ async function getMosqueDetailsGoogle(mosque) {
 
 /**
  * Find nearby mosques. Uses Google if a key is configured, otherwise OSM.
+ *
+ *   coords                – { latitude, longitude }
+ *   radius                – metres (default 5000)
+ *   enrichDetailsCount    – Google only: how many top results to enrich
+ *                           with Place Details (phone, website). Default 12.
+ *                           Set to 0 to skip enrichment (cheaper, no contact
+ *                           info on cards until you tap into a mosque).
  */
-export async function findNearbyMosques(coords, { radius = 5000 } = {}) {
+export async function findNearbyMosques(
+  coords,
+  { radius = 5000, enrichDetailsCount } = {}
+) {
   if (getApiKey()) {
-    return findNearbyMosquesGoogle(coords, { radius });
+    return findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount });
   }
   return findNearbyMosquesOSM(coords, { radius });
 }

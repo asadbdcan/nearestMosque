@@ -134,10 +134,18 @@ npx eas build -p ios       # IPA via EAS Build (Apple Developer required)
 ### Finding nearby mosques
 `src/services/places.js` is a router that picks between two providers:
 
-- **OpenStreetMap (default):** `src/services/osm.js` posts an [Overpass API](https://overpass-api.de/) query for nodes/ways/relations tagged `amenity=place_of_worship` + `religion=muslim` (plus `building=mosque`) within the radius, deduplicates them, and ranks by haversine distance.
-- **Google Places (optional):** calls `https://maps.googleapis.com/maps/api/place/nearbysearch/json` with `type=mosque` and ranks the same way. Used when an API key is configured.
+- **OpenStreetMap (default):** `src/services/osm.js` posts an [Overpass API](https://overpass-api.de/) query for nodes/ways/relations tagged `amenity=place_of_worship` + `religion=muslim` (plus `building=mosque`) within the radius, deduplicates them, and ranks by haversine distance. `website` and `phone` are read directly from OSM tags — no second round-trip needed.
+- **Google Places (optional):** calls `https://maps.googleapis.com/maps/api/place/nearbysearch/json` with `type=mosque` and ranks the same way. Then the **top 12 nearest results are enriched in parallel** with `Place Details` so phone, website, and full formatted address show up on the Home cards. The remaining results enrich on-demand when you tap into them.
 
 Both providers return identical mosque shapes so the screens don't care which one is active.
+
+#### Google Places cost note
+Each Home refresh with Google enabled is roughly:
+
+- 1 × Nearby Search (`$32 / 1,000` — historical; check [current pricing](https://mapsplatform.google.com/pricing/))
+- up to 12 × Place Details — **Contact Data** SKU is the relevant one for phone/website (`$3 / 1,000` historically) plus Basic Data which is typically free.
+
+So a single refresh is on the order of $0.03–$0.07 of usage. The standard $200/month free credit covers thousands of refreshes per month. If you want to disable enrichment to keep costs minimal, pass `enrichDetailsCount: 0` to `findNearbyMosques` in `HomeScreen.js`.
 
 ### Reading Salah times from a mosque website
 `src/services/salahScraper.js` does a best-effort extraction:
