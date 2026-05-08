@@ -147,16 +147,22 @@ Each Home refresh with Google enabled is roughly:
 
 So a single refresh is on the order of $0.03–$0.07 of usage. The standard $200/month free credit covers thousands of refreshes per month. If you want to disable enrichment to keep costs minimal, pass `enrichDetailsCount: 0` to `findNearbyMosques` in `HomeScreen.js`.
 
-### Reading Salah times from a mosque website
-`src/services/salahScraper.js` does a best-effort extraction:
+### Prayer times — read directly from each mosque's website
 
-1. Fetches the mosque website HTML.
-2. Strips `<script>` / `<style>` / tags, decodes entities.
-3. For each prayer name (Fajr, Sunrise, Dhuhr/Zuhr, Asr, Maghrib, Isha, Jummah) finds the matching line and pulls the first 1–2 time tokens (`5:14 AM`, `17:30`, `1:30 pm` …).
-4. If two times appear on the same row, the second is treated as **Iqamah/Jamaat**.
-5. Returns `{ times, iqamah, source, confidence }` where confidence is `high` / `medium` / `low` based on how many prayers were resolved.
+The app shows **the times the mosque itself publishes**, not astronomically-calculated times. Iqamah times are a community decision (the mosque committee picks them) and they don't match astronomical Adhan times exactly, so calculated values are misleading next to a real mosque. We honour what the mosque itself says.
 
-This works for the majority of mosque sites that use plain HTML tables or labelled rows. Some sites (e.g. heavy SPAs, image-only timetables, or PDFs) cannot be scraped — in those cases the UI shows a clear empty state with a one-tap link to the website.
+When you tap a mosque, the app calls `/api/mosque-times` (`api/mosque-times.js` — a Vercel serverless function) which runs a multi-step scrape pipeline:
+
+1. **Main page.** Fetches the mosque's website homepage and parses it.
+2. **Prayer-time widget iframes.** If the homepage embeds a known prayer-time widget — `timing.athanplus.com` (Masjidal/Athan+), `mawaqit.net`, `islamicfinder.org`, `masjidiapp.com`, `deenlocator.com`, `mosqueoftheworld.com`, `salahtimes.com` — the function follows that iframe's URL directly. These widgets have well-structured HTML tables and parse very reliably.
+3. **Common subpaths.** If the homepage doesn't expose times, the function tries `/prayer-times`, `/salah-times`, `/timetable`, `/timings`, `/jamaat-times`, `/iqamah-times`, etc., on the same origin in parallel.
+4. **Best result wins.** The pipeline ranks all attempts by confidence (`high` ≥ 5 prayers, `medium` ≥ 3, `low` < 3) and returns the strongest result, with `source` (the exact URL it parsed) and `sourceType` (`main` / `widget` / `subpath`) for transparency.
+
+The HTML parsing layer (`api/_lib/parsePrayerHtml.js`, mirrored in `salahScraper.js` for native) does two passes — table-aware (preserve `<tr>` boundaries to keep Adhan/Iqamah column ordering) and plain-text fallback — then merges them.
+
+Caching: each mosque's parsed result is cached at the Vercel edge for 15 min (`s-maxage=900, stale-while-revalidate=3600`), so repeat opens are instant and Vercel function invocations stay cheap.
+
+If a particular mosque's site can't be parsed — image-only timetables, fully JS-rendered SPAs, dead sites — the detail screen shows a clear empty state with a one-tap link to the website. That's an inherent limit of HTML scraping, not a bug.
 
 ### Refresh behaviour
 - The **gold "Refresh" pill** at the top re-runs the full pipeline: GPS → Places → ranking.
