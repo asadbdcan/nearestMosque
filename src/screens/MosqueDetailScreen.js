@@ -8,7 +8,6 @@ import {
   Pressable,
   Linking,
   Platform,
-  Modal,
 } from 'react-native';
 import * as Haptics from 'expo-haptics';
 
@@ -16,13 +15,6 @@ import SalahTimeCard from '../components/SalahTimeCard';
 import RefreshButton from '../components/RefreshButton';
 import { theme } from '../theme';
 import { getMosqueDetails } from '../services/places';
-import {
-  fetchPrayerTimes,
-  CALCULATION_METHODS,
-  ASR_SCHOOLS,
-  DEFAULT_METHOD,
-  DEFAULT_SCHOOL,
-} from '../services/aladhan';
 import { fetchSalahTimes } from '../services/salahScraper';
 
 export default function MosqueDetailScreen({ route, navigation }) {
@@ -31,33 +23,46 @@ export default function MosqueDetailScreen({ route, navigation }) {
   const [details, setDetails] = useState(null);
   const [loadingDetails, setLoadingDetails] = useState(true);
 
-  const [calc, setCalc] = useState(null); // AlAdhan result
-  const [calcLoading, setCalcLoading] = useState(false);
-  const [calcError, setCalcError] = useState(null);
-
-  const [method, setMethod] = useState(DEFAULT_METHOD);
-  const [school, setSchool] = useState(DEFAULT_SCHOOL);
-  const [showMethodPicker, setShowMethodPicker] = useState(false);
-
-  // Optional secondary source: try to scrape the mosque website. We only
-  // run this when the user explicitly asks for it.
-  const [scraped, setScraped] = useState(null);
-  const [scrapeLoading, setScrapeLoading] = useState(false);
-  const [scrapeError, setScrapeError] = useState(null);
+  const [salah, setSalah] = useState(null);
+  const [salahLoading, setSalahLoading] = useState(false);
+  const [salahError, setSalahError] = useState(null);
 
   const coords = useMemo(
-    () =>
-      details?.location ||
-      mosque.location ||
-      null,
+    () => details?.location || mosque.location || null,
     [details, mosque]
   );
 
-  // Load Place Details (for website / phone / formatted address) — only
-  // if the mosque didn't already come pre-enriched from the Home screen.
-  const loadDetails = useCallback(async () => {
+  const loadFromWebsite = useCallback(async (websiteUrl) => {
+    setSalahLoading(true);
+    setSalahError(null);
+    try {
+      const result = await fetchSalahTimes(websiteUrl);
+      if (Object.keys(result.times || {}).length === 0) {
+        setSalahError(
+          "We reached the mosque's website but couldn't find a prayer-times section we recognise."
+        );
+        setSalah(null);
+      } else {
+        setSalah(result);
+        Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success).catch(() => {});
+      }
+    } catch (e) {
+      setSalahError(e.message);
+      setSalah(null);
+      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning).catch(() => {});
+    } finally {
+      setSalahLoading(false);
+    }
+  }, []);
+
+  const loadDetailsAndTimes = useCallback(async () => {
+    setLoadingDetails(true);
+    setSalahError(null);
+    setSalah(null);
+
+    let resolved = null;
     if (mosque.detailsLoaded) {
-      setDetails({
+      resolved = {
         name: mosque.name,
         address: mosque.address,
         phone: mosque.phone,
@@ -67,67 +72,33 @@ export default function MosqueDetailScreen({ route, navigation }) {
         ratingsTotal: mosque.ratingsTotal,
         openingHours: mosque.openingHours,
         location: mosque.location,
-      });
-      setLoadingDetails(false);
+      };
+    } else {
+      try {
+        resolved = await getMosqueDetails(mosque);
+      } catch (e) {
+        resolved = {
+          name: mosque.name,
+          address: mosque.address,
+          location: mosque.location,
+        };
+      }
+    }
+    setDetails(resolved);
+    if (resolved?.name) navigation.setOptions({ title: resolved.name });
+    setLoadingDetails(false);
+
+    if (!resolved.website) {
+      setSalahError(
+        "This mosque doesn't have a website on file, so we can't read its prayer times."
+      );
       return;
     }
-    setLoadingDetails(true);
-    try {
-      const d = await getMosqueDetails(mosque);
-      setDetails(d);
-      navigation.setOptions({ title: d.name || mosque.name });
-    } catch (e) {
-      // Non-fatal: prayer times can still be calculated from coords.
-      setDetails({
-        name: mosque.name,
-        address: mosque.address,
-        location: mosque.location,
-      });
-    } finally {
-      setLoadingDetails(false);
-    }
-  }, [mosque, navigation]);
 
-  // Fetch calculated prayer times from AlAdhan whenever coords or
-  // method/school change.
-  const loadCalculated = useCallback(async () => {
-    if (!coords) return;
-    setCalcLoading(true);
-    setCalcError(null);
-    try {
-      const result = await fetchPrayerTimes(coords, { method, school });
-      setCalc(result);
-      Haptics.selectionAsync().catch(() => {});
-    } catch (e) {
-      setCalcError(e.message);
-    } finally {
-      setCalcLoading(false);
-    }
-  }, [coords, method, school]);
+    await loadFromWebsite(resolved.website);
+  }, [mosque, navigation, loadFromWebsite]);
 
-  useEffect(() => { loadDetails(); }, [loadDetails]);
-  useEffect(() => { loadCalculated(); }, [loadCalculated]);
-
-  const onTryWebsite = useCallback(async () => {
-    if (!details?.website) return;
-    setScrapeLoading(true);
-    setScrapeError(null);
-    setScraped(null);
-    try {
-      const result = await fetchSalahTimes(details.website);
-      if (Object.keys(result.times).length === 0) {
-        setScrapeError(
-          "We couldn't recognise prayer times on this mosque's website."
-        );
-      } else {
-        setScraped(result);
-      }
-    } catch (e) {
-      setScrapeError(e.message);
-    } finally {
-      setScrapeLoading(false);
-    }
-  }, [details?.website]);
+  useEffect(() => { loadDetailsAndTimes(); }, [loadDetailsAndTimes]);
 
   const onOpenWebsite = () => {
     if (details?.website) Linking.openURL(details.website).catch(() => {});
@@ -173,110 +144,81 @@ export default function MosqueDetailScreen({ route, navigation }) {
         <ActionBtn label="Call" onPress={onCall} disabled={!details?.phone} />
       </View>
 
-      {/* PRIMARY: calculated times from AlAdhan */}
       <View style={styles.section}>
         <View style={styles.sectionHeader}>
           <View style={{ flex: 1 }}>
-            <Text style={styles.sectionLabel}>Today's prayer times</Text>
-            {!!calc && (
+            <Text style={styles.sectionLabel}>Prayer times</Text>
+            {salah?.source && (
               <Text style={styles.sourceMicro}>
-                Calculated for this mosque's location · {calc.methodName}
+                from {prettyHost(salah.source)}
+                {salah.sourceType === 'widget' && ' · prayer-times widget'}
+                {salah.sourceType === 'subpath' && ' · timetable page'}
               </Text>
             )}
           </View>
-          <Pressable onPress={() => setShowMethodPicker(true)} hitSlop={8}>
-            <Text style={styles.refreshLink}>Method</Text>
-          </Pressable>
-        </View>
-
-        {calcLoading && !calc ? (
-          <View style={styles.loadingBox}>
-            <ActivityIndicator color={theme.colors.primary} />
-            <Text style={styles.loadingText}>Calculating prayer times…</Text>
-          </View>
-        ) : calc ? (
-          <SalahTimeCard times={calc.times} highlight={nextPrayerKey(calc.times)} />
-        ) : calcError ? (
-          <View style={styles.emptyBox}>
-            <Text style={styles.emptyTitle}>Could not calculate times</Text>
-            <Text style={styles.emptyBody}>{calcError}</Text>
-            <View style={{ marginTop: 14, alignItems: 'center' }}>
-              <RefreshButton onPress={loadCalculated} loading={calcLoading} label="Try again" />
-            </View>
-          </View>
-        ) : null}
-
-        {!!calc && (
-          <View style={styles.metaInfoCard}>
-            <Text style={styles.metaInfoLine}>
-              {calc.gregorian?.weekdayName}, {calc.gregorian?.day} {calc.gregorian?.monthName} {calc.gregorian?.year}
-            </Text>
-            <Text style={styles.metaInfoLine}>
-              {calc.hijri?.day} {calc.hijri?.monthName} {calc.hijri?.year} AH
-            </Text>
-            {!!calc.timezone && (
-              <Text style={styles.metaInfoMuted}>Timezone: {calc.timezone}</Text>
-            )}
-          </View>
-        )}
-      </View>
-
-      {/* SECONDARY: cross-check with the mosque's own website */}
-      <View style={styles.section}>
-        <View style={styles.sectionHeader}>
-          <Text style={styles.sectionLabel}>Verify with mosque website</Text>
           {!!details?.website && (
-            <Pressable onPress={onTryWebsite} hitSlop={8} disabled={scrapeLoading}>
+            <Pressable
+              onPress={() => loadFromWebsite(details.website)}
+              hitSlop={8}
+              disabled={salahLoading}
+            >
               <Text style={styles.refreshLink}>
-                {scrapeLoading ? 'Reading…' : scraped ? 'Refresh' : 'Read site'}
+                {salahLoading ? 'Reading…' : 'Refresh'}
               </Text>
             </Pressable>
           )}
         </View>
 
-        {!details?.website ? (
-          <View style={styles.helperBox}>
-            <Text style={styles.helperText}>
-              No website is listed for this mosque, so we can't verify their published Iqamah times.
-            </Text>
-          </View>
-        ) : scrapeLoading ? (
+        {loadingDetails || salahLoading ? (
           <View style={styles.loadingBox}>
             <ActivityIndicator color={theme.colors.primary} />
-            <Text style={styles.loadingText}>Reading the mosque's site…</Text>
+            <Text style={styles.loadingText}>
+              {loadingDetails
+                ? 'Loading mosque details…'
+                : `Reading prayer times from ${prettyHost(details?.website || '')}…`}
+            </Text>
           </View>
-        ) : scraped ? (
+        ) : salah ? (
           <View>
-            <SalahTimeCard times={scraped.times} />
-            {Object.keys(scraped.iqamah || {}).length > 0 && (
+            <SalahTimeCard times={salah.times} highlight={nextPrayerKey(salah.times)} />
+            {Object.keys(salah.iqamah || {}).length > 0 && (
               <View style={{ marginTop: 14 }}>
                 <Text style={styles.sectionLabel}>Iqamah / Jamaat</Text>
-                <SalahTimeCard times={scraped.iqamah} />
+                <SalahTimeCard times={salah.iqamah} />
               </View>
             )}
             <Text style={styles.sourceMicro}>
-              Source: {prettyHost(scraped.source)} · confidence: {scraped.confidence}
-            </Text>
-          </View>
-        ) : scrapeError ? (
-          <View style={styles.helperBox}>
-            <Text style={styles.helperText}>{scrapeError}</Text>
-            <Text style={[styles.helperText, { marginTop: 6 }]}>
-              The calculated times above are still accurate for this mosque's location.
+              Confidence: {salah.confidence}. Times are extracted directly from the mosque's website — tap "Website" above to verify.
             </Text>
           </View>
         ) : (
-          <View style={styles.helperBox}>
-            <Text style={styles.helperText}>
-              Tap "Read site" to fetch this mosque's published Iqamah times from {prettyHost(details.website)}. Many mosque sites publish their schedule in a format we can recognise; some don't, in which case the calculated times above remain your source.
+          <View style={styles.emptyBox}>
+            <Text style={styles.emptyTitle}>No prayer times available</Text>
+            <Text style={styles.emptyBody}>
+              {salahError ||
+                "We could not extract prayer times from this mosque's website."}
             </Text>
+            {!!details?.website && (
+              <View style={{ marginTop: 14, alignItems: 'center' }}>
+                <RefreshButton
+                  onPress={() => loadFromWebsite(details.website)}
+                  loading={salahLoading}
+                  label="Try again"
+                />
+              </View>
+            )}
+            {!!details?.website && (
+              <Pressable onPress={onOpenWebsite} style={{ marginTop: 12, alignSelf: 'center' }}>
+                <Text style={styles.linkText}>Open {prettyHost(details.website)} →</Text>
+              </Pressable>
+            )}
           </View>
         )}
       </View>
 
       {!!details?.openingHours?.length && (
         <View style={styles.section}>
-          <Text style={styles.sectionLabel}>Opening hours</Text>
+          <Text style={styles.sectionLabel}>Opening hours (Google)</Text>
           <View style={styles.hoursCard}>
             {details.openingHours.map((line) => (
               <Text key={line} style={styles.hoursLine}>{line}</Text>
@@ -284,139 +226,10 @@ export default function MosqueDetailScreen({ route, navigation }) {
           </View>
         </View>
       )}
-
-      <MethodPicker
-        visible={showMethodPicker}
-        method={method}
-        school={school}
-        onClose={() => setShowMethodPicker(false)}
-        onChange={(m, s) => {
-          setMethod(m);
-          setSchool(s);
-          setShowMethodPicker(false);
-        }}
-      />
     </ScrollView>
   );
 }
 
-// ---------------------------------------------------------------------------
-// Method picker modal
-// ---------------------------------------------------------------------------
-
-function MethodPicker({ visible, method, school, onClose, onChange }) {
-  const [m, setM] = useState(method);
-  const [s, setS] = useState(school);
-
-  useEffect(() => {
-    setM(method);
-    setS(school);
-  }, [method, school, visible]);
-
-  return (
-    <Modal visible={visible} animationType="slide" transparent onRequestClose={onClose}>
-      <Pressable style={pickerStyles.backdrop} onPress={onClose} />
-      <View style={pickerStyles.sheet}>
-        <View style={pickerStyles.handle} />
-        <Text style={pickerStyles.title}>Calculation method</Text>
-        <ScrollView style={pickerStyles.list}>
-          {CALCULATION_METHODS.map((opt) => (
-            <Pressable
-              key={opt.id}
-              onPress={() => setM(opt.id)}
-              style={[pickerStyles.row, m === opt.id && pickerStyles.rowActive]}
-            >
-              <View style={{ flex: 1 }}>
-                <Text style={[pickerStyles.rowName, m === opt.id && pickerStyles.rowNameActive]}>
-                  {opt.name}
-                </Text>
-                <Text style={pickerStyles.rowMeta}>{opt.region}</Text>
-              </View>
-              {m === opt.id && <Text style={pickerStyles.check}>{'✓'}</Text>}
-            </Pressable>
-          ))}
-        </ScrollView>
-
-        <Text style={[pickerStyles.title, { marginTop: 12 }]}>Asr school</Text>
-        {ASR_SCHOOLS.map((opt) => (
-          <Pressable
-            key={opt.id}
-            onPress={() => setS(opt.id)}
-            style={[pickerStyles.row, s === opt.id && pickerStyles.rowActive]}
-          >
-            <Text style={[pickerStyles.rowName, s === opt.id && pickerStyles.rowNameActive]}>
-              {opt.name}
-            </Text>
-            {s === opt.id && <Text style={pickerStyles.check}>{'✓'}</Text>}
-          </Pressable>
-        ))}
-
-        <View style={pickerStyles.footer}>
-          <Pressable style={pickerStyles.cancel} onPress={onClose}>
-            <Text style={pickerStyles.cancelText}>Cancel</Text>
-          </Pressable>
-          <Pressable style={pickerStyles.apply} onPress={() => onChange(m, s)}>
-            <Text style={pickerStyles.applyText}>Apply</Text>
-          </Pressable>
-        </View>
-      </View>
-    </Modal>
-  );
-}
-
-const pickerStyles = StyleSheet.create({
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: 'rgba(0,0,0,0.45)' },
-  sheet: {
-    position: 'absolute',
-    bottom: 0,
-    left: 0,
-    right: 0,
-    maxHeight: '85%',
-    backgroundColor: theme.colors.background,
-    borderTopLeftRadius: 24,
-    borderTopRightRadius: 24,
-    paddingHorizontal: 16,
-    paddingTop: 8,
-    paddingBottom: 24,
-  },
-  handle: {
-    width: 44,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: theme.colors.divider,
-    alignSelf: 'center',
-    marginVertical: 8,
-  },
-  title: { ...theme.typography.title, color: theme.colors.text, marginVertical: 8 },
-  list: { maxHeight: 320 },
-  row: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: theme.radii.md,
-    marginVertical: 2,
-  },
-  rowActive: { backgroundColor: theme.colors.accentSoft },
-  rowName: { ...theme.typography.subtitle, color: theme.colors.text },
-  rowNameActive: { color: theme.colors.primaryDark },
-  rowMeta: { ...theme.typography.caption, color: theme.colors.textMuted, marginTop: 2 },
-  check: { fontSize: 18, color: theme.colors.primary, fontWeight: '700' },
-  footer: { flexDirection: 'row', marginTop: 14 },
-  cancel: { flex: 1, paddingVertical: 14, alignItems: 'center', borderRadius: theme.radii.md },
-  cancelText: { ...theme.typography.subtitle, color: theme.colors.textMuted },
-  apply: {
-    flex: 1,
-    paddingVertical: 14,
-    alignItems: 'center',
-    borderRadius: theme.radii.md,
-    backgroundColor: theme.colors.primary,
-  },
-  applyText: { ...theme.typography.subtitle, color: '#fff' },
-});
-
-// ---------------------------------------------------------------------------
-// Tiny helpers + styles
 // ---------------------------------------------------------------------------
 
 function Pill({ text, gold }) {
@@ -428,12 +241,8 @@ function Pill({ text, gold }) {
 }
 const pillStyles = StyleSheet.create({
   pill: {
-    paddingHorizontal: 10,
-    paddingVertical: 5,
-    borderRadius: theme.radii.pill,
-    backgroundColor: 'rgba(255,255,255,0.15)',
-    marginRight: 8,
-    marginTop: 6,
+    paddingHorizontal: 10, paddingVertical: 5, borderRadius: theme.radii.pill,
+    backgroundColor: 'rgba(255,255,255,0.15)', marginRight: 8, marginTop: 6,
   },
   gold: { backgroundColor: theme.colors.accent },
   text: { ...theme.typography.caption, color: '#fff', fontWeight: '600' },
@@ -456,13 +265,9 @@ function ActionBtn({ label, onPress, disabled }) {
 }
 const actionStyles = StyleSheet.create({
   btn: {
-    flex: 1,
-    alignItems: 'center',
-    paddingVertical: 12,
-    backgroundColor: theme.colors.surface,
-    borderRadius: theme.radii.md,
-    marginHorizontal: 4,
-    ...theme.shadow.card,
+    flex: 1, alignItems: 'center', paddingVertical: 12,
+    backgroundColor: theme.colors.surface, borderRadius: theme.radii.md,
+    marginHorizontal: 4, ...theme.shadow.card,
   },
   label: { ...theme.typography.subtitle, color: theme.colors.primary },
 });
@@ -471,34 +276,23 @@ function formatDistance(meters) {
   if (meters < 1000) return `${Math.round(meters)} m away`;
   return `${(meters / 1000).toFixed(meters < 10000 ? 1 : 0)} km away`;
 }
-
 function prettyHost(url) {
-  try {
-    return new URL(url).host.replace(/^www\./, '');
-  } catch {
-    return url;
-  }
+  try { return new URL(url).host.replace(/^www\./, ''); } catch { return url; }
 }
-
 function nextPrayerKey(times) {
   if (!times) return null;
   const now = new Date();
   const minutesNow = now.getHours() * 60 + now.getMinutes();
   const order = ['Fajr', 'Dhuhr', 'Asr', 'Maghrib', 'Isha'];
-  let best = null;
-  let bestDelta = Infinity;
+  let best = null, bestDelta = Infinity;
   for (const name of order) {
     const m = parseTimeToMinutes(times[name]);
     if (m == null) continue;
     const delta = m - minutesNow;
-    if (delta >= 0 && delta < bestDelta) {
-      best = name;
-      bestDelta = delta;
-    }
+    if (delta >= 0 && delta < bestDelta) { best = name; bestDelta = delta; }
   }
   return best;
 }
-
 function parseTimeToMinutes(t) {
   if (!t) return null;
   const m = /^(\d{1,2})[:.](\d{2})\s*(AM|PM)?/i.exec(t.trim());
@@ -515,82 +309,39 @@ const styles = StyleSheet.create({
   scroll: { flex: 1, backgroundColor: theme.colors.background },
   hero: {
     backgroundColor: theme.colors.primary,
-    paddingHorizontal: 20,
-    paddingTop: 18,
-    paddingBottom: 24,
+    paddingHorizontal: 20, paddingTop: 18, paddingBottom: 24,
   },
   heroEyebrow: {
-    ...theme.typography.caption,
-    color: theme.colors.accentSoft,
-    letterSpacing: 1.2,
-    textTransform: 'uppercase',
+    ...theme.typography.caption, color: theme.colors.accentSoft,
+    letterSpacing: 1.2, textTransform: 'uppercase',
   },
   heroTitle: { ...theme.typography.display, color: '#fff', marginTop: 4 },
   heroAddr: { ...theme.typography.body, color: theme.colors.accentSoft, marginTop: 6 },
   metaRow: { flexDirection: 'row', flexWrap: 'wrap', marginTop: 8 },
-
-  actionRow: {
-    flexDirection: 'row',
-    marginHorizontal: 12,
-    marginTop: -16,
-  },
-
+  actionRow: { flexDirection: 'row', marginHorizontal: 12, marginTop: -16 },
   section: { marginHorizontal: 16, marginTop: 22 },
   sectionHeader: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'flex-start',
-    marginBottom: 8,
+    flexDirection: 'row', justifyContent: 'space-between',
+    alignItems: 'flex-start', marginBottom: 8,
   },
   sectionLabel: {
-    ...theme.typography.caption,
-    color: theme.colors.textMuted,
-    textTransform: 'uppercase',
-    letterSpacing: 1.2,
+    ...theme.typography.caption, color: theme.colors.textMuted,
+    textTransform: 'uppercase', letterSpacing: 1.2,
   },
   refreshLink: { ...theme.typography.subtitle, color: theme.colors.primary },
-
   loadingBox: { paddingVertical: 30, alignItems: 'center' },
-  loadingText: { ...theme.typography.body, color: theme.colors.textMuted, marginTop: 10 },
-
+  loadingText: { ...theme.typography.body, color: theme.colors.textMuted, marginTop: 10, textAlign: 'center', paddingHorizontal: 20 },
   emptyBox: {
-    backgroundColor: theme.colors.surface,
-    padding: 18,
-    borderRadius: theme.radii.lg,
-    ...theme.shadow.card,
+    backgroundColor: theme.colors.surface, padding: 18,
+    borderRadius: theme.radii.lg, ...theme.shadow.card,
   },
   emptyTitle: { ...theme.typography.title, color: theme.colors.text },
   emptyBody: { ...theme.typography.body, color: theme.colors.textMuted, marginTop: 6 },
-
-  helperBox: {
-    backgroundColor: theme.colors.surface,
-    padding: 14,
-    borderRadius: theme.radii.md,
-    ...theme.shadow.card,
-  },
-  helperText: { ...theme.typography.body, color: theme.colors.textMuted },
-
-  sourceMicro: {
-    ...theme.typography.caption,
-    color: theme.colors.textMuted,
-    marginTop: 4,
-  },
-
-  metaInfoCard: {
-    marginTop: 12,
-    paddingVertical: 10,
-    paddingHorizontal: 14,
-    backgroundColor: theme.colors.surfaceAlt,
-    borderRadius: theme.radii.md,
-  },
-  metaInfoLine: { ...theme.typography.body, color: theme.colors.text },
-  metaInfoMuted: { ...theme.typography.caption, color: theme.colors.textMuted, marginTop: 2 },
-
+  sourceMicro: { ...theme.typography.caption, color: theme.colors.textMuted, marginTop: 8 },
+  linkText: { ...theme.typography.subtitle, color: theme.colors.primary },
   hoursCard: {
-    backgroundColor: theme.colors.surface,
-    padding: 14,
-    borderRadius: theme.radii.md,
-    ...theme.shadow.card,
+    backgroundColor: theme.colors.surface, padding: 14,
+    borderRadius: theme.radii.md, ...theme.shadow.card,
   },
   hoursLine: { ...theme.typography.body, color: theme.colors.text, paddingVertical: 2 },
 });
