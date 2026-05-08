@@ -57,6 +57,7 @@ export default function MosqueCard({ mosque, onPress, highlight = false }) {
               numberOfLines={1}
             >
               {site.icon} {site.kind === 'website' ? site.host : `${site.label} · ${site.host}`}
+              {mosque.websiteOverride ? '  ✓' : ''}
             </Text>
           )}
           <View style={styles.metaRow}>

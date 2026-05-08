@@ -2,6 +2,7 @@ import Constants from 'expo-constants';
 import { Platform } from 'react-native';
 import { distanceMeters } from './location';
 import { findNearbyMosquesOSM, getMosqueDetailsOSM } from './osm';
+import { findOverrideWebsite } from '../data/mosqueWebsiteOverrides';
 
 /**
  * Mosque provider router.
@@ -197,6 +198,17 @@ async function findNearbyMosquesGoogle(coords, { radius, enrichDetailsCount = EN
     );
   }
 
+  // Apply curated website overrides — runs AFTER Google enrichment so a
+  // hand-picked URL trumps whatever Google had stored (often a Facebook
+  // page or nothing at all).
+  for (const m of list) {
+    const override = findOverrideWebsite(m);
+    if (override) {
+      m.website = override;
+      m.websiteOverride = true;
+    }
+  }
+
   return list;
 }
 
@@ -208,11 +220,20 @@ async function getMosqueDetailsGoogle(mosque) {
     throw new Error(data.error_message || `Place details: ${data.status}`);
   }
   const r = data.result || {};
+
+  // Apply curated override on the details path too — covers the
+  // detail-screen lookup for mosques that weren't in the top-N enrich set.
+  const overrideForDetails = findOverrideWebsite({
+    name: r.name || mosque.name,
+    address: r.formatted_address || mosque.address,
+  });
+
   return {
     name: r.name,
     address: r.formatted_address,
     phone: r.formatted_phone_number || r.international_phone_number,
-    website: r.website,
+    website: overrideForDetails || r.website,
+    websiteOverride: !!overrideForDetails,
     googleMapsUrl: r.url,
     rating: r.rating ?? null,
     ratingsTotal: r.user_ratings_total ?? null,

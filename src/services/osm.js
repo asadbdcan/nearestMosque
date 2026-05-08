@@ -1,4 +1,5 @@
 import { distanceMeters } from './location';
+import { findOverrideWebsite } from '../data/mosqueWebsiteOverrides';
 
 /**
  * OpenStreetMap / Overpass API provider — completely free, no API key.
@@ -144,6 +145,16 @@ export async function findNearbyMosquesOSM(coords, { radius = 5000 } = {}) {
 
   const list = Array.from(seen.values());
   list.sort((a, b) => a.distance - b.distance);
+
+  // Apply curated overrides — pinned URLs win over whatever the OSM tags say.
+  for (const m of list) {
+    const override = findOverrideWebsite(m);
+    if (override) {
+      m.website = override;
+      m.websiteOverride = true;
+    }
+  }
+
   return list;
 }
 
