@@ -1,237 +1,296 @@
 import { Platform } from 'react-native';
 
 /**
- * Best-effort scraper that extracts Salah (prayer) times from a mosque
- * website's HTML. Mosque sites are extremely heterogeneous — there is no
- * universal schema — so this uses keyword + proximity heuristics:
+ * Mosque-website prayer-time scraper (client side).
  *
- *   1. Fetch HTML (via the mosque website URL).
- *   2. Strip scripts/styles, decode entities, collapse whitespace.
- *   3. For each prayer name, scan the cleaned text for the nearest time
- *      token (e.g. "5:14", "5:14 AM", "17:30") within a reasonable window.
- *   4. Pick the first plausible Iqamah/Jamaat time, falling back to Adhan.
+ * On web, calls /api/mosque-times — a Vercel serverless function that
+ * does a multi-step scrape on the server:
+ *
+ *   1. fetches the mosque's main page
+ *   2. detects embedded prayer-time widget iframes (Masjidal/Athan+,
+ *      Mawaqit, IslamicFinder, MasjidiApp, DeenLocator) and follows them
+ *   3. tries common subpaths like /prayer-times, /timetable, /timings
+ *   4. returns the highest-confidence result it found
+ *
+ * On native (iOS/Android) we run the same logic locally — no CORS to
+ * worry about and no Vercel function to call. To keep the bundle small
+ * we use a slimmed-down sequential variant.
  *
  * Returns:
  *   {
- *     times: { Fajr: "5:14 AM", Dhuhr: "1:30 PM", ... },
- *     iqamah: { ... }   // when a separate iqamah column was detected
- *     source: "https://...",
- *     confidence: "high" | "medium" | "low"
+ *     times:       { Fajr, Sunrise, Dhuhr, Asr, Maghrib, Isha, Jummah },
+ *     iqamah:      { ... },                         // when 2nd column existed
+ *     confidence:  'high' | 'medium' | 'low',
+ *     source:      'https://…',                     // exact URL we parsed
+ *     sourceType:  'main' | 'widget' | 'subpath',
+ *     attempts:    [...]                            // diagnostic, web only
  *   }
- *
- * Web note: most mosque websites don't send CORS headers, so direct
- * browser fetches fail. On `Platform.OS === 'web'` we route through a
- * public CORS proxy. On native (iOS/Android) the fetch goes direct.
  */
 
-/**
- * Build the ordered list of fetchers to try when running on web.
- *
- *   1. Same-origin Vercel function (/api/fetch-html?url=…) — works on
- *      the deployed site, no CORS, no third-party dependency.
- *   2. EXPO_PUBLIC_CORS_PROXY — lets you point at your own proxy.
- *   3. Public proxies as last-resort fallbacks.
- *
- * Each fetcher is { label, build(url) -> requestUrl }. On native we just
- * fetch directly — no CORS exists.
- */
-function webFetchStrategies() {
-  const strategies = [
-    {
-      label: 'serverless',
-      build: (u) => `/api/fetch-html?url=${encodeURIComponent(u)}`,
-    },
-  ];
-  const userProxy = process.env.EXPO_PUBLIC_CORS_PROXY;
-  if (userProxy) {
-    strategies.push({
-      label: 'user-proxy',
-      build: (u) => `${userProxy}${encodeURIComponent(u)}`,
-    });
+// ---------------------------------------------------------------------------
+// Public entry point
+// ---------------------------------------------------------------------------
+
+export async function fetchSalahTimes(mosqueWebsiteUrl) {
+  if (!mosqueWebsiteUrl) {
+    throw new Error(
+      "This mosque does not have a website on file, so we can't fetch its prayer times."
+    );
   }
-  // Public fallbacks — last resort. Each handles `?url=` differently.
-  strategies.push(
-    {
-      label: 'allorigins',
-      build: (u) => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
-    },
-    {
-      label: 'corsproxy.io',
-      build: (u) => `https://corsproxy.io/?${encodeURIComponent(u)}`,
-    },
-    {
-      label: 'thingproxy',
-      build: (u) => `https://thingproxy.freeboard.io/fetch/${u}`,
-    }
-  );
-  return strategies;
+
+  if (Platform.OS === 'web') {
+    return fetchViaServer(mosqueWebsiteUrl);
+  }
+  return fetchOnNative(mosqueWebsiteUrl);
 }
 
-const PRAYER_KEYS = [
-  { key: 'Fajr', synonyms: ['fajr', 'fajar', 'subh', 'subuh', 'subh sadiq'] },
-  { key: 'Sunrise', synonyms: ['sunrise', 'shuruq', 'shurooq', 'ishraq'] },
-  { key: 'Dhuhr', synonyms: ['dhuhr', 'duhr', 'zuhr', 'zhur', 'thuhr', 'luhr'] },
-  { key: 'Asr', synonyms: ['asr', "'asr", 'asar'] },
-  { key: 'Maghrib', synonyms: ['maghrib', 'magrib', 'maghreb'] },
-  { key: 'Isha', synonyms: ['isha', "'isha", 'ishaa', 'esha'] },
-  { key: 'Jummah', synonyms: ['jummah', 'jumuah', 'jumu’ah', 'jumua', 'jumma', 'jum‘ah', 'friday prayer', 'friday khutbah'] },
+// ---------------------------------------------------------------------------
+// Web — call the Vercel serverless function
+// ---------------------------------------------------------------------------
+
+async function fetchViaServer(url) {
+  const endpoint = `/api/mosque-times?url=${encodeURIComponent(url)}`;
+  let res;
+  try {
+    res = await fetch(endpoint);
+  } catch (e) {
+    throw new Error(`Could not reach the prayer-times service (${e.message}).`);
+  }
+
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const j = await res.json();
+      detail = j.error || j.detail || '';
+      if (Array.isArray(j.attempts) && j.attempts.length) {
+        const failures = j.attempts
+          .filter((a) => !a.ok)
+          .map((a) => `${a.url}: ${a.error || 'failed'}`)
+          .slice(0, 3)
+          .join('; ');
+        if (failures) detail += ` Tried: ${failures}`;
+      }
+    } catch {}
+    throw new Error(
+      `Could not read the mosque website (server returned ${res.status}). ${detail}`.trim()
+    );
+  }
+
+  const data = await res.json();
+  if (!data || (Object.keys(data.times || {}).length === 0)) {
+    throw new Error(
+      "We couldn't find a prayer-times section on this mosque's website."
+    );
+  }
+  return data;
+}
+
+// ---------------------------------------------------------------------------
+// Native — same multi-step logic, run locally
+// ---------------------------------------------------------------------------
+
+const KNOWN_WIDGET_HOSTS = [
+  'timing.athanplus.com',
+  'mawaqit.net',
+  'mosqueoftheworld.com',
+  'masjidiapp.com',
+  'api.masjidiapp.com',
+  'islamicfinder.org',
+  'www.islamicfinder.org',
+  'deenlocator.com',
+  'salahtimes.com',
 ];
 
-const TIME_RE = /(?:(?:[01]?\d|2[0-3])[:.][0-5]\d(?:\s?[ap]\.?m\.?)?|(?:1[0-2]|[1-9])[:.][0-5]\d\s?[ap]\.?m\.?)/gi;
+const COMMON_SUBPATHS = [
+  '/prayer-times',
+  '/prayer-time',
+  '/salah-times',
+  '/timetable',
+  '/timings',
+  '/jamaat-times',
+  '/iqamah-times',
+];
 
-const ENTITY_MAP = {
-  '&amp;': '&',
-  '&lt;': '<',
-  '&gt;': '>',
-  '&quot;': '"',
-  '&#39;': "'",
-  '&apos;': "'",
-  '&nbsp;': ' ',
-};
+async function fetchOnNative(mainUrl) {
+  // Local copy of the parser — duplicated rather than shared so the
+  // server-side `api/_lib` module never gets bundled into the React
+  // Native build (Metro can choke on `import.meta`-style ESM).
+  const { parsePrayerTimesFromHtml } = nativeParser();
 
-function decodeEntities(s) {
-  return s
-    .replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (m) => ENTITY_MAP[m] || m)
-    .replace(/&#(\d+);/g, (_, n) => {
-      try { return String.fromCharCode(parseInt(n, 10)); } catch { return _; }
+  async function fetchHtml(u) {
+    const r = await fetch(u, {
+      headers: {
+        'User-Agent': 'NearestMosqueApp/1.0',
+        Accept: 'text/html,*/*',
+      },
     });
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    return r.text();
+  }
+
+  const attempts = [];
+  const isAcceptable = (p) => p && p.confidence !== 'low';
+  const rank = (c) => (c === 'high' ? 3 : c === 'medium' ? 2 : 1);
+  const countTimes = (p) => Object.keys(p?.times || {}).length;
+  const better = (a, b) =>
+    !b || rank(a.confidence) > rank(b.confidence) || countTimes(a) > countTimes(b);
+
+  let best = null;
+  let mainHtml;
+  try {
+    mainHtml = await fetchHtml(mainUrl);
+    const parsed = parsePrayerTimesFromHtml(mainHtml);
+    attempts.push({ kind: 'main', url: mainUrl, ok: true, ...parsed });
+    best = { ...parsed, source: mainUrl, sourceType: 'main' };
+    if (isAcceptable(parsed)) return { ...best, attempts };
+  } catch (e) {
+    attempts.push({ kind: 'main', url: mainUrl, ok: false, error: e.message });
+  }
+
+  // Widget iframes
+  if (mainHtml) {
+    const widgets = detectWidgetIframes(mainHtml, mainUrl);
+    for (const w of widgets) {
+      try {
+        const html = await fetchHtml(w);
+        const parsed = parsePrayerTimesFromHtml(html);
+        attempts.push({ kind: 'widget', url: w, ok: true, ...parsed });
+        const cand = { ...parsed, source: w, sourceType: 'widget' };
+        if (better(cand, best)) best = cand;
+        if (isAcceptable(parsed)) return { ...best, attempts };
+      } catch (e) {
+        attempts.push({ kind: 'widget', url: w, ok: false, error: e.message });
+      }
+    }
+  }
+
+  // Common subpaths (sequential on native to be gentle on quotas)
+  let origin;
+  try { origin = new URL(mainUrl).origin; } catch {}
+  if (origin) {
+    for (const path of COMMON_SUBPATHS) {
+      const u = origin + path;
+      try {
+        const html = await fetchHtml(u);
+        const parsed = parsePrayerTimesFromHtml(html);
+        attempts.push({ kind: 'subpath', url: u, ok: true, ...parsed });
+        const cand = { ...parsed, source: u, sourceType: 'subpath' };
+        if (better(cand, best)) best = cand;
+        if (isAcceptable(parsed)) return { ...best, attempts };
+      } catch {
+        // 404s here are normal — most subpaths won't exist. Skip silently.
+      }
+    }
+  }
+
+  if (!best || countTimes(best) === 0) {
+    throw new Error(
+      "We couldn't find a prayer-times section on this mosque's website."
+    );
+  }
+  return { ...best, attempts };
 }
 
-export function stripHtml(html) {
-  return decodeEntities(
-    html
+function detectWidgetIframes(html, baseUrl) {
+  const re = /<iframe[^>]+src=["']([^"']+)["'][^>]*>/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(html))) {
+    let abs;
+    try { abs = new URL(m[1], baseUrl).toString(); } catch { continue; }
+    let host;
+    try { host = new URL(abs).hostname.toLowerCase(); } catch { continue; }
+    if (KNOWN_WIDGET_HOSTS.some((h) => host === h || host.endsWith('.' + h))) {
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Native parser (kept inline so Metro doesn't try to bundle api/_lib)
+// ---------------------------------------------------------------------------
+
+function nativeParser() {
+  const PRAYER_KEYS = [
+    { key: 'Fajr', synonyms: ['fajr', 'fajar', 'subh', 'subuh'] },
+    { key: 'Sunrise', synonyms: ['sunrise', 'shuruq', 'shurooq', 'ishraq'] },
+    { key: 'Dhuhr', synonyms: ['dhuhr', 'duhr', 'zuhr', 'zhur', 'thuhr', 'luhr'] },
+    { key: 'Asr', synonyms: ['asr', "'asr", 'asar'] },
+    { key: 'Maghrib', synonyms: ['maghrib', 'magrib', 'maghreb'] },
+    { key: 'Isha', synonyms: ['isha', "'isha", 'ishaa', 'esha'] },
+    { key: 'Jummah', synonyms: ['jummah', 'jumuah', 'jumua', 'jumma', 'jumah', 'friday prayer'] },
+  ];
+  const TIME_RE = /(?:(?:[01]?\d|2[0-3])[:.][0-5]\d(?:\s?[ap]\.?m\.?)?|(?:1[0-2]|[1-9])[:.][0-5]\d\s?[ap]\.?m\.?)/gi;
+  const ENT = { '&amp;':'&','&lt;':'<','&gt;':'>','&quot;':'"','&#39;':"'",'&apos;':"'",'&nbsp;':' ' };
+  const decodeEntities = (s) =>
+    s.replace(/&(amp|lt|gt|quot|#39|apos|nbsp);/g, (m) => ENT[m] || m)
+     .replace(/&#(\d+);/g, (_, n) => { try { return String.fromCharCode(parseInt(n,10)); } catch { return _; } });
+  const stripTags = (s) => s.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+  const normaliseTime = (raw) => {
+    if (!raw) return null;
+    let t = raw.trim().toUpperCase().replace(/\./g, ':').replace(/\s+/g, ' ');
+    return t.replace(/(\d)([AP]M)/, '$1 $2');
+  };
+  const pickTimes = (text, max = 3) => (String(text).match(TIME_RE) || []).slice(0, max).map(normaliseTime);
+  const matchesAnyPrayer = (text, syns) => {
+    const lower = text.toLowerCase();
+    return syns.some((s) => new RegExp(`\\b${s.replace(/[.*+?^${}()|[\\]\\\\]/g, '\\$&')}\\b`, 'i').test(lower));
+  };
+
+  function extractFromRows(html) {
+    const chunks = html
       .replace(/<script[\s\S]*?<\/script>/gi, ' ')
       .replace(/<style[\s\S]*?<\/style>/gi, ' ')
-      .replace(/<noscript[\s\S]*?<\/noscript>/gi, ' ')
-      .replace(/<!--([\s\S]*?)-->/g, ' ')
-      .replace(/<\/?(?:tr|td|th|li|p|div|br|h[1-6]|table|tbody|thead|section)[^>]*>/gi, '\n')
-      .replace(/<[^>]+>/g, ' ')
-  )
-    .replace(/[\t\r ]+/g, ' ')
-    .replace(/\n{2,}/g, '\n')
-    .trim();
-}
-
-function normaliseTime(raw) {
-  if (!raw) return null;
-  let t = raw.trim().toUpperCase().replace(/\./g, ':').replace(/\s+/g, ' ');
-  // Collapse "5:14AM" -> "5:14 AM"
-  t = t.replace(/(\d)([AP]M)/, '$1 $2');
-  // Some sites use 24h without meridiem; keep as-is.
-  return t;
-}
-
-function findPrayerLine(lines, synonyms) {
-  const re = new RegExp(`\\b(?:${synonyms.join('|')})\\b`, 'i');
-  for (let i = 0; i < lines.length; i++) {
-    if (re.test(lines[i])) return { idx: i, line: lines[i] };
-  }
-  return null;
-}
-
-function pickTimesFromLine(line, max = 3) {
-  const matches = line.match(TIME_RE) || [];
-  return matches.slice(0, max).map(normaliseTime);
-}
-
-export function parseSalahTimes(html) {
-  const text = stripHtml(html);
-  const lines = text
-    .split(/\n+/)
-    .map((l) => l.trim())
-    .filter(Boolean);
-
-  const times = {};
-  const iqamah = {};
-  let hits = 0;
-
-  for (const { key, synonyms } of PRAYER_KEYS) {
-    const found = findPrayerLine(lines, synonyms);
-    if (!found) continue;
-
-    // Look at the matching line and the next 1–2 lines (some sites split
-    // the prayer name and its time across <td>s).
-    const window = lines.slice(found.idx, Math.min(lines.length, found.idx + 3)).join(' ');
-    const candidates = pickTimesFromLine(window, 3);
-    if (candidates.length === 0) continue;
-
-    // Heuristic: when two times appear on the same row, the first is usually
-    // Adhan (Begins) and the second is Iqamah (Jamaat).
-    times[key] = candidates[0];
-    if (candidates[1]) iqamah[key] = candidates[1];
-    hits += 1;
-  }
-
-  let confidence = 'low';
-  if (hits >= 5) confidence = 'high';
-  else if (hits >= 3) confidence = 'medium';
-
-  return { times, iqamah, confidence };
-}
-
-/**
- * Fetch a mosque website and extract its Salah times.
- *
- *   url  – mosque website URL (from Google Place Details).
- */
-export async function fetchSalahTimes(url) {
-  if (!url) throw new Error('This mosque has no website on file, so we cannot fetch its prayer times.');
-
-  const html = await fetchHtml(url);
-  const parsed = parseSalahTimes(html);
-  return { ...parsed, source: url };
-}
-
-/**
- * Fetch HTML for `url`. On native goes direct; on web walks the
- * proxy strategy list and returns the first response that yields a
- * non-empty 2xx HTML body.
- */
-async function fetchHtml(url) {
-  if (Platform.OS !== 'web') {
-    let res;
-    try {
-      res = await fetch(url, {
-        headers: {
-          'User-Agent': 'NearestMosqueApp/1.0 (+https://example.com)',
-          Accept: 'text/html,*/*',
-        },
-      });
-    } catch (e) {
-      throw new Error(`Could not reach the mosque website (${e.message}).`);
-    }
-    if (!res.ok) throw new Error(`Mosque website returned ${res.status}.`);
-    return res.text();
-  }
-
-  const failures = [];
-  for (const strat of webFetchStrategies()) {
-    try {
-      const res = await fetch(strat.build(url), {
-        headers: { Accept: 'text/html,*/*' },
-      });
-      if (!res.ok) {
-        failures.push(`${strat.label}: HTTP ${res.status}`);
-        continue;
+      .split(/<\/?(?:tr|li|p|h[1-6]|section|article|div)[^>]*>/i);
+    const times = {}, iqamah = {};
+    for (const chunk of chunks) {
+      const text = decodeEntities(stripTags(chunk));
+      if (!text) continue;
+      for (const { key, synonyms } of PRAYER_KEYS) {
+        if (!matchesAnyPrayer(text, synonyms)) continue;
+        const tokens = pickTimes(text, 3);
+        if (!tokens.length) continue;
+        if (!times[key]) times[key] = tokens[0];
+        if (tokens[1] && !iqamah[key]) iqamah[key] = tokens[1];
       }
-      const text = await res.text();
-      if (!text || text.length < 30) {
-        failures.push(`${strat.label}: empty response`);
-        continue;
-      }
-      return text;
-    } catch (e) {
-      failures.push(`${strat.label}: ${e.message || e}`);
-      continue;
     }
+    return { times, iqamah };
   }
 
-  throw new Error(
-    `The mosque website could not be loaded from the browser. ` +
-      `All proxy attempts failed (${failures.join('; ')}). ` +
-      `Tap "Website" to open it directly, or deploy this app with the included /api/fetch-html function.`
-  );
-}
+  function extractFromText(html) {
+    const text = decodeEntities(
+      html.replace(/<script[\s\S]*?<\/script>/gi, ' ')
+          .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+          .replace(/<\/?(?:tr|td|th|li|p|div|br|h[1-6]|table|tbody|thead|section)[^>]*>/gi, '\n')
+          .replace(/<[^>]+>/g, ' ')
+    ).replace(/[\t\r ]+/g, ' ').replace(/\n{2,}/g, '\n').trim();
+    const lines = text.split(/\n+/).map((l) => l.trim()).filter(Boolean);
+    const times = {}, iqamah = {};
+    for (const { key, synonyms } of PRAYER_KEYS) {
+      let idx = -1;
+      for (let i = 0; i < lines.length; i++) if (matchesAnyPrayer(lines[i], synonyms)) { idx = i; break; }
+      if (idx < 0) continue;
+      const window = lines.slice(idx, Math.min(lines.length, idx + 3)).join(' ');
+      const tokens = pickTimes(window, 3);
+      if (!tokens.length) continue;
+      if (!times[key]) times[key] = tokens[0];
+      if (tokens[1] && !iqamah[key]) iqamah[key] = tokens[1];
+    }
+    return { times, iqamah };
+  }
 
-// Exported for testing in isolation.
-export const __test__ = { PRAYER_KEYS, TIME_RE, normaliseTime };
+  function parsePrayerTimesFromHtml(html) {
+    const a = extractFromRows(html);
+    const b = extractFromText(html);
+    const times = { ...b.times, ...a.times };
+    const iqamah = { ...b.iqamah, ...a.iqamah };
+    const filled = ['Fajr','Dhuhr','Asr','Maghrib','Isha'].filter((k) => times[k]);
+    let confidence = 'low';
+    if (filled.length >= 5) confidence = 'high';
+    else if (filled.length >= 3) confidence = 'medium';
+    return { times, iqamah, confidence };
+  }
+
+  return { parsePrayerTimesFromHtml };
+}
